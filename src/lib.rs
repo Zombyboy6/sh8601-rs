@@ -242,7 +242,7 @@ where
 {
     interface: IFACE,
     reset: RST,
-    framebuffer: Framebuffer,
+    pub framebuffer: Framebuffer,
     config: DisplaySize,
 }
 
