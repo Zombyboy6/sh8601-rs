@@ -51,14 +51,10 @@ mod graphics_core;
 
 use alloc::boxed::Box;
 use embedded_graphics::{
-    framebuffer::{self, buffer_size},
-    pixelcolor::{
-        Gray8, Rgb555, Rgb565, Rgb666, Rgb888,
-        raw::{LittleEndian, RawU24, RawU32},
-    },
+    framebuffer::{self},
+    pixelcolor::{Gray8, Rgb565, Rgb666, Rgb888, raw::LittleEndian},
     prelude::{IntoStorage, PixelColor, Point},
 };
-use embedded_graphics_core::draw_target::DrawTarget;
 use embedded_hal::delay::DelayNs;
 
 /// Configuration for the display dimensions.
@@ -218,10 +214,6 @@ impl<C: SH8601ColorMode + 'static, const WIDTH: usize, const HEIGHT: usize, cons
             Framebuffer::Static(arr) => arr.data(),
             Framebuffer::Heap(boxed) => boxed.data(),
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.as_slice().len()
     }
 }
 
@@ -497,7 +489,7 @@ where
         // Send the pixel data via the interface's optimized method.
         // The send_pixels method itself should handle sending RAMWR (0x2C).
         self.interface
-            .send_pixels(&self.framebuffer.as_slice())
+            .send_pixels(self.framebuffer.as_slice())
             .map_err(DriverError::InterfaceError)?;
         Ok(())
     }
@@ -511,7 +503,7 @@ where
     ) -> Result<(), DriverError<IFACE::Error, RST::Error>> {
         self.set_window(x_start, y_start, x_end, y_end)?;
         let bytes_per_pixel = COLOR::BYTES_PER_PIXEL;
-        let fb_width = WIDTH as usize * bytes_per_pixel;
+        let fb_width = WIDTH * bytes_per_pixel;
         let width = (x_end - x_start + 1) as usize;
         let height = (y_end - y_start + 1) as usize;
         let mut pixel_data = alloc::vec::Vec::with_capacity(width * height * bytes_per_pixel);
@@ -519,7 +511,7 @@ where
         for y in 0..height {
             let offset = (y_start as usize + y) * fb_width + (x_start as usize * bytes_per_pixel);
             let row_end = offset + (width * bytes_per_pixel);
-            if offset < self.framebuffer.len() && row_end <= self.framebuffer.len() {
+            if offset < N && row_end <= N {
                 pixel_data.extend_from_slice(&self.framebuffer.as_slice()[offset..row_end]);
             } else {
                 return Err(DriverError::InvalidConfiguration(

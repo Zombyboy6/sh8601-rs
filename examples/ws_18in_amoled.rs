@@ -5,15 +5,12 @@ use sh8601_rs::{
     DMA_CHUNK_SIZE, DisplaySize, ResetDriver, Sh8601Driver, Ws18AmoledDriver, framebuffer_size,
 };
 
+use embedded_graphics::text::LineHeight;
 use embedded_graphics::{
-    mono_font::{
-        MonoTextStyle,
-        ascii::{FONT_6X10, FONT_10X20},
-    },
+    mono_font::{MonoTextStyle, ascii::FONT_10X20},
     pixelcolor::Rgb888,
     prelude::*,
-    primitives::{Circle, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, Triangle},
-    text::{Alignment, LineHeight, Text, TextStyleBuilder},
+    text::{Alignment, Text, TextStyleBuilder},
 };
 
 extern crate alloc;
