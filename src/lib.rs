@@ -50,6 +50,14 @@ extern crate alloc;
 mod graphics_core;
 
 use alloc::boxed::Box;
+use embedded_graphics::{
+    framebuffer::{self, buffer_size},
+    pixelcolor::{
+        Gray8, Rgb555, Rgb565, Rgb666, Rgb888,
+        raw::{LittleEndian, RawU24, RawU32},
+    },
+    prelude::{IntoStorage, PixelColor, Point},
+};
 use embedded_graphics_core::draw_target::DrawTarget;
 use embedded_hal::delay::DelayNs;
 
@@ -142,18 +150,29 @@ pub mod commands {
     pub const RDCTRLD1: u8 = 0x54; // Read CTRL Display 1
 }
 
-/// Color modes supported by the SH8601 display controller.
-pub enum ColorMode {
-    /// 16-bit RGB565 format
-    Rgb565,
-    /// 24-bit RGB888 format
-    Rgb888,
-    /// 18-bit RGB666 format
-    Rgb666,
-    /// 8-bit 256 Gray
-    Gray8,
+impl SH8601ColorMode for Rgb565 {
+    const COMMAND_PARAMETER: u8 = 0x55;
+    const BYTES_PER_PIXEL: usize = 2;
+}
+impl SH8601ColorMode for Rgb888 {
+    const COMMAND_PARAMETER: u8 = 0x77;
+    const BYTES_PER_PIXEL: usize = 3;
+}
+impl SH8601ColorMode for Rgb666 {
+    const COMMAND_PARAMETER: u8 = 0x66;
+    const BYTES_PER_PIXEL: usize = 3;
+}
+impl SH8601ColorMode for Gray8 {
+    const BYTES_PER_PIXEL: usize = 1;
+    const COMMAND_PARAMETER: u8 = 0x11;
 }
 
+pub trait SH8601ColorMode: PixelColor + IntoStorage {
+    const BYTES_PER_PIXEL: usize;
+    const COMMAND_PARAMETER: u8;
+}
+
+/*
 impl ColorMode {
     /// Returns the number of bytes per pixel for the color format.
     pub const fn bytes_per_pixel(&self) -> usize {
@@ -165,31 +184,39 @@ impl ColorMode {
         }
     }
 }
+*/
 
 /// Computes the framebuffer size (in bytes) for a given display and color mode.
 /// Recommended to use when defining generic constant framebuffer size (const `N`) when instantiating display controller driver with `new_static` and `new_heap`.
-pub const fn framebuffer_size(display: DisplaySize, color: ColorMode) -> usize {
-    (display.width as usize) * (display.height as usize) * color.bytes_per_pixel()
+pub const fn framebuffer_size<C: SH8601ColorMode>(display: DisplaySize) -> usize {
+    (display.width as usize) * (display.height as usize) * C::BYTES_PER_PIXEL
 }
 
 /// Frambuffer enum to hold either a static array or a boxed array
-pub enum Framebuffer {
-    Static(&'static mut [u8]),
-    Heap(Box<[u8]>),
+pub enum Framebuffer<
+    C: SH8601ColorMode + 'static,
+    const WIDTH: usize,
+    const HEIGHT: usize,
+    const N: usize,
+> {
+    Static(&'static mut framebuffer::Framebuffer<C, C::Raw, LittleEndian, WIDTH, HEIGHT, N>),
+    Heap(Box<framebuffer::Framebuffer<C, C::Raw, LittleEndian, WIDTH, HEIGHT, N>>),
 }
 
-impl Framebuffer {
+impl<C: SH8601ColorMode + 'static, const WIDTH: usize, const HEIGHT: usize, const N: usize>
+    Framebuffer<C, WIDTH, HEIGHT, N>
+{
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         match self {
-            Framebuffer::Static(arr) => arr,
-            Framebuffer::Heap(boxed) => boxed,
+            Framebuffer::Static(arr) => arr.data_mut(),
+            Framebuffer::Heap(boxed) => boxed.data_mut(),
         }
     }
 
     pub fn as_slice(&self) -> &[u8] {
         match self {
-            Framebuffer::Static(arr) => arr,
-            Framebuffer::Heap(boxed) => boxed,
+            Framebuffer::Static(arr) => arr.data(),
+            Framebuffer::Heap(boxed) => boxed.data(),
         }
     }
 
@@ -198,57 +225,68 @@ impl Framebuffer {
     }
 }
 
-// Implement Framebuffer Deref to allow accessing the underlying array
-impl core::ops::Deref for Framebuffer {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Framebuffer::Static(arr) => arr,
-            Framebuffer::Heap(boxed) => boxed,
+macro_rules! impl_fb {
+    ($color_type:ident) => {
+        impl<const WIDTH: usize, const HEIGHT: usize, const N: usize>
+            Framebuffer<$color_type, WIDTH, HEIGHT, N>
+        {
+            pub fn set_pixel(&mut self, x: i32, y: i32, color: $color_type) {
+                match self {
+                    Framebuffer::Static(framebuffer) => {
+                        framebuffer.set_pixel(Point::new(x, y), color)
+                    }
+                    Framebuffer::Heap(framebuffer) => {
+                        framebuffer.set_pixel(Point::new(x, y), color)
+                    }
+                }
+            }
         }
-    }
+    };
 }
 
-// Implement Frambuffer DerefMut for mutable access
-impl core::ops::DerefMut for Framebuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Framebuffer::Static(arr) => arr,
-            Framebuffer::Heap(boxed) => boxed,
-        }
-    }
-}
+impl_fb!(Rgb888);
+impl_fb!(Rgb565);
+impl_fb!(Rgb666);
+impl_fb!(Gray8);
 
 /// Main Driver for the SH8601 display controller.
 ///
 /// Generic over the display interface (`IFACE`) and reset pin (`RST`).
-pub struct Sh8601Driver<IFACE, RST>
+pub struct Sh8601Driver<IFACE, RST, COLOR, const WIDTH: usize, const HEIGHT: usize, const N: usize>
 where
     IFACE: ControllerInterface,
     RST: ResetInterface,
+    COLOR: SH8601ColorMode + 'static,
 {
     interface: IFACE,
     reset: RST,
-    framebuffer: Framebuffer,
-    config: DisplaySize,
+    framebuffer: Framebuffer<COLOR, WIDTH, HEIGHT, N>,
+    color_marker: core::marker::PhantomData<COLOR>,
 }
 
-impl<IFACE, RST> Sh8601Driver<IFACE, RST>
+impl<IFACE, RST, COLOR, const WIDTH: usize, const HEIGHT: usize, const N: usize>
+    Sh8601Driver<IFACE, RST, COLOR, WIDTH, HEIGHT, N>
 where
     IFACE: ControllerInterface,
     RST: ResetInterface,
+    COLOR: SH8601ColorMode,
 {
     /// Creates a new driver instance with static array and initializes the display.
     /// N is a constant representing the framebuffer size (number of pixels).
     /// N is calculated as `DisplaySize.width * DisplaySize.height * bytes_per_pixel`, where `bytes_per_pixel` is 2 for RGB565, 3 for RGB888, etc.
     /// You can use the `framebuffer_size` helper function to calculate N.
-    pub fn new_static<DELAY, const N: usize>(
+    pub fn new_static<DELAY>(
         interface: IFACE,
         reset: RST,
-        color: ColorMode,
-        config: DisplaySize,
         mut delay: DELAY,
-        framebuffer: &'static mut [u8; N],
+        framebuffer: &'static mut framebuffer::Framebuffer<
+            COLOR,
+            COLOR::Raw,
+            LittleEndian,
+            WIDTH,
+            HEIGHT,
+            N,
+        >,
     ) -> Result<Self, DriverError<IFACE::Error, RST::Error>>
     where
         DELAY: DelayNs,
@@ -258,22 +296,20 @@ where
         let mut driver = Self {
             interface,
             reset,
-            framebuffer: Framebuffer::Static(&mut framebuffer[..]),
-            config,
+            color_marker: core::marker::PhantomData,
+            framebuffer: Framebuffer::Static(framebuffer),
         };
         driver.hard_reset()?;
-        driver.initialize_display(&mut delay, color)?;
+        driver.initialize_display(&mut delay)?;
         Ok(driver)
     }
 
     /// Creates a new driver instance with a boxed array framebuffer.
     /// N is a constant representing the framebuffer size (number of pixels).
     /// N is calculated as `DisplaySize.width * DisplaySize.height * bytes_per_pixel`, where `bytes_per_pixel` is 2 for RGB565, 3 for RGB888, etc.
-    pub fn new_heap<DELAY, const N: usize>(
+    pub fn new_heap<DELAY>(
         interface: IFACE,
         reset: RST,
-        color: ColorMode,
-        config: DisplaySize,
         mut delay: DELAY,
     ) -> Result<Self, DriverError<IFACE::Error, RST::Error>>
     where
@@ -283,11 +319,18 @@ where
         let mut driver = Self {
             interface,
             reset,
-            framebuffer: Framebuffer::Heap(Box::new([0u8; N])),
-            config,
+            framebuffer: Framebuffer::Heap(Box::new(framebuffer::Framebuffer::<
+                COLOR,
+                _,
+                LittleEndian,
+                WIDTH,
+                HEIGHT,
+                N,
+            >::new())),
+            color_marker: core::marker::PhantomData,
         };
         driver.hard_reset()?;
-        driver.initialize_display(&mut delay, color)?;
+        driver.initialize_display(&mut delay)?;
         Ok(driver)
     }
 
@@ -301,7 +344,6 @@ where
     pub fn initialize_display<DELAY>(
         &mut self,
         delay: &mut DELAY,
-        color: ColorMode,
     ) -> Result<(), DriverError<IFACE::Error, RST::Error>>
     where
         DELAY: DelayNs,
@@ -310,24 +352,9 @@ where
         delay.delay_ms(10);
         self.send_command(commands::SLPOUT)?;
         delay.delay_ms(120);
-        match color {
-            ColorMode::Rgb565 => {
-                // Set pixel format to RGB565
-                self.send_command_with_data(commands::COLMOD, &[0x55])?;
-            }
-            ColorMode::Rgb888 => {
-                // Set pixel format to RGB888
-                self.send_command_with_data(commands::COLMOD, &[0x77])?;
-            }
-            ColorMode::Rgb666 => {
-                // Set pixel format to RGB666
-                self.send_command_with_data(commands::COLMOD, &[0x66])?;
-            }
-            ColorMode::Gray8 => {
-                // Set pixel format to 8-bit grayscale
-                self.send_command_with_data(commands::COLMOD, &[0x11])?;
-            }
-        }
+
+        self.send_command_with_data(commands::COLMOD, &[COLOR::COMMAND_PARAMETER])?;
+
         delay.delay_ms(5);
         self.send_command_with_data(commands::MADCTL, &[0x00])?;
         self.send_command_with_data(commands::TESCAN, &[0x01, 0xC5])?;
@@ -410,7 +437,7 @@ where
                 "Window width/height cannot be zero",
             ));
         }
-        if x_start >= self.config.width || y_start >= self.config.height {
+        if x_start >= WIDTH as u16 || y_start >= HEIGHT as u16 {
             return Err(DriverError::InvalidConfiguration(
                 "Window start coordinates out of bounds",
             ));
@@ -466,11 +493,11 @@ where
     /// This is typically called after drawing operations are complete.
     pub fn flush(&mut self) -> Result<(), DriverError<IFACE::Error, RST::Error>> {
         // Ensure the window covers the whole framebuffer before writing
-        self.set_window(0, 0, self.config.width - 1, self.config.height - 1)?;
+        self.set_window(0, 0, WIDTH as u16 - 1, HEIGHT as u16 - 1)?;
         // Send the pixel data via the interface's optimized method.
         // The send_pixels method itself should handle sending RAMWR (0x2C).
         self.interface
-            .send_pixels(&self.framebuffer)
+            .send_pixels(&self.framebuffer.as_slice())
             .map_err(DriverError::InterfaceError)?;
         Ok(())
     }
@@ -481,11 +508,10 @@ where
         x_end: u16,
         y_start: u16,
         y_end: u16,
-        color: ColorMode,
     ) -> Result<(), DriverError<IFACE::Error, RST::Error>> {
         self.set_window(x_start, y_start, x_end, y_end)?;
-        let bytes_per_pixel = color.bytes_per_pixel();
-        let fb_width = self.config.width as usize * bytes_per_pixel;
+        let bytes_per_pixel = COLOR::BYTES_PER_PIXEL;
+        let fb_width = WIDTH as usize * bytes_per_pixel;
         let width = (x_end - x_start + 1) as usize;
         let height = (y_end - y_start + 1) as usize;
         let mut pixel_data = alloc::vec::Vec::with_capacity(width * height * bytes_per_pixel);
@@ -494,7 +520,7 @@ where
             let offset = (y_start as usize + y) * fb_width + (x_start as usize * bytes_per_pixel);
             let row_end = offset + (width * bytes_per_pixel);
             if offset < self.framebuffer.len() && row_end <= self.framebuffer.len() {
-                pixel_data.extend_from_slice(&self.framebuffer[offset..row_end]);
+                pixel_data.extend_from_slice(&self.framebuffer.as_slice()[offset..row_end]);
             } else {
                 return Err(DriverError::InvalidConfiguration(
                     "Framebuffer slice out of bounds",
